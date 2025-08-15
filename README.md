@@ -1,1 +1,0 @@
-# -ema-cross-backtest
