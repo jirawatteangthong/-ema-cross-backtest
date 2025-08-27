@@ -12,7 +12,7 @@ CONFIG = {
     "EXCHANGE_KIND": "binanceusdm",       # คงไว้ = Futures USDT-M
     "SYMBOL": "BTC/USDT",
     "TIMEFRAME_TAG": "1h",                # ใช้เป็น label ในข้อความ (ไม่ดึงแท่ง)
-    "DEPTH_LIMIT": 1000,                  # 5/10/20/50/100/500/1000
+    "DEPTH_LIMIT": 10000,                  # 5/10/20/50/100/500/1000
     "TOP_N": 5,
     "LOOP_MINUTES": 30,                   # วนลูปทุกกี่นาที
     "TIMEZONE": "Asia/Bangkok",
