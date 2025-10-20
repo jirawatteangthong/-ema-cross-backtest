@@ -165,20 +165,22 @@ def create_exchange():
         "password": PASSWORD,
         "enableRateLimit": True,
         "options": {
-            "defaultType": "swap",  # USDT perpetual
+            "defaultType": "swap",   # USDT perpetual
+            "positionSide": "net"    # important for Net mode
         }
     })
     exchange.load_markets()
     try:
-        exchange.set_leverage(LEVERAGE, SYMBOL, params={"mgnMode":"isolated"})
-    except Exception as e:
-        print("Set leverage failed (continue):", str(e))
-    try:
-        exchange.set_margin_mode("isolated", SYMBOL)
+        # Set isolated margin mode with Net position
+        exchange.set_margin_mode("isolated", SYMBOL, params={"posSide": "net"})
     except Exception as e:
         print("Set margin mode failed (continue):", str(e))
+    try:
+        # Set leverage (1 - 125 allowed on OKX futures)
+        exchange.set_leverage(LEVERAGE, SYMBOL, params={"mgnMode": "isolated", "posSide": "net"})
+    except Exception as e:
+        print("Set leverage failed (continue):", str(e))
     return exchange
-
 # -------------------- Strategy Core --------------------
 def fetch_ohlcv(exchange, symbol, timeframe, limit=200):
     ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
