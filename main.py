@@ -35,11 +35,11 @@ TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
 # ====== FIXED SETTINGS (ตามที่ยืนยัน) ======
 SYMBOLS = ["DOGE/USDT:USDT", "TRX/USDT:USDT"]
 TIMEFRAME = "5m"
-LEVERAGE = 15                 # คุณยืนยัน 15x
+LEVERAGE = 25                 # คุณยืนยัน 15x
 MARGIN_MODE = "isolated"      # Isolated + Net
 
 # ขนาดต่อไม้แบบคงที่จริง (USDT notional) — สำคัญที่สุดสำหรับทุนเล็ก
-FIXED_NOTIONAL_USDT = 0.5     # ถ้าจะปรับให้ใหญ่ขึ้นค่อยแก้ตัวเลขนี้
+FIXED_NOTIONAL_USDT = 3     # ถ้าจะปรับให้ใหญ่ขึ้นค่อยแก้ตัวเลขนี้
 # ไม่ใช้ risk mode เพื่อไม่ให้ขนาดแกว่งตาม ATR
 RISK_PER_TRADE = 0.0
 
