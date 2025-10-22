@@ -42,7 +42,7 @@ POLL_SECONDS = 5
 
 # Position sizing: เลือกได้ 2 โหมด
 FIXED_NOTIONAL_USDT = 0.5  # ถ้า > 0 จะใช้จำนวน USDT ต่อไม้เป็นค่าคงที่ (เช่น 1.5)
-RISK_PER_TRADE = 0.01       # ถ้า FIXED_NOTIONAL_USDT == 0.0 จะใช้ % ของ Equity (เช่น 0.01 = 1%)
+RISK_PER_TRADE = 0.0       # ถ้า FIXED_NOTIONAL_USDT == 0.0 จะใช้ % ของ Equity (เช่น 0.01 = 1%)
 
 MAX_TRADES_PER_DAY = 20
 STOP_AFTER_SL_STREAK = 5    # SL ติดกัน 5 ครั้ง -> หยุดทั้งวัน
