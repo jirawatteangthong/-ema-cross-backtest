@@ -1,72 +1,69 @@
 #!/usr/bin/env python3
 """
-OKX EMA Sideway Scalper (Market orders) — v1.0
-- Sideway filter with EMA9/21/50 + ATR
-- Mean-reversion entries around EMA9
+OKX EMA Sideway Scalper — Multi-Symbol Safe Mode (Rank A) — FINAL
+
+- Scan 3 pairs: XRP, DOGE, TRX (fixed in code)
+- Choose the safest signal (Rank A = lowest ATR) and open ONLY ONE position at a time
+- Sideway filter (EMA9/21 gap + ATR% + EMA50 slope)
+- Mean reversion entries around EMA9
 - TP/SL in ATR units
 - Single DCA (fixed size), Basket TP
-- Max 10 trades/day
-- Isolated, leverage configurable
-- Daily summary to Telegram (once/day)
+- Limit max 20 trades/day
+- Stop trading for the day after 5 consecutive SLs (notify Telegram)
+- Daily summary to Telegram once/day (23:55 Asia/Bangkok)
+- Timeframe 5m
+- Leverage 10x (Isolated + Net mode on OKX)
+- ENV needed only for OKX creds + Telegram (5 keys)
 
-Environment variables (with defaults for local testing):
+REQUIRED ENV:
   OKX_API_KEY, OKX_SECRET, OKX_PASSWORD
   TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
-Optional:
-  SYMBOL=BTC/USDT:USDT
-  TIMEFRAME=5m
-  LEVERAGE=10
-  RISK_PER_TRADE=0.01          # 1% of equity
-  MAX_TRADES_PER_DAY=10
-  DAILY_SUMMARY_HOUR=23        # Asia/Bangkok hour 0-23
-  DAILY_SUMMARY_MINUTE=55
-  POLL_SECONDS=5
 """
 
-import os
-import time
-import math
-import json
-import traceback
+import os, time, math, traceback
 from datetime import datetime
-import pytz
-import requests
-
+import pytz, requests
 import ccxt
 import numpy as np
 
-# -------------------- Config --------------------
-API_KEY = os.getenv('OKX_API_KEY', 'YOUR_OKX_API_KEY')
-SECRET = os.getenv('OKX_SECRET', 'YOUR_OKX_SECRET')
-PASSWORD = os.getenv('OKX_PASSWORD', 'YOUR_OKX_PASSPHRASE')
+# ======== ENV (ONLY exchange + telegram) =========
+API_KEY = os.getenv('OKX_API_KEY', '')
+SECRET = os.getenv('OKX_SECRET', '')
+PASSWORD = os.getenv('OKX_PASSWORD', '')
 
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', 'YOUR_TELEGRAM_TOKEN')
-TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', 'YOUR_CHAT_ID')
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', '')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
 
-SYMBOL = os.getenv('SYMBOL', 'BTC/USDT:USDT')
-TIMEFRAME = os.getenv('TIMEFRAME', '5m')
-LEVERAGE = int(os.getenv('LEVERAGE', '10'))
-RISK_PER_TRADE = float(os.getenv('RISK_PER_TRADE', '0.01'))
-MAX_TRADES_PER_DAY = int(os.getenv('MAX_TRADES_PER_DAY', '10'))
-POLL_SECONDS = int(os.getenv('POLL_SECONDS', '5'))
+# ======== FIXED STRATEGY PARAMS (EDIT HERE IF NEEDED) =========
+SYMBOLS = ["XRP/USDT:USDT", "DOGE/USDT:USDT", "TRX/USDT:USDT"]
+TIMEFRAME = "5m"
+LEVERAGE = 10  # คุณตั้งให้ 10x ก่อน ถ้าดีค่อยปรับ
+POLL_SECONDS = 5
 
-DAILY_SUMMARY_HOUR = int(os.getenv('DAILY_SUMMARY_HOUR', '23'))     # Bangkok time
-DAILY_SUMMARY_MINUTE = int(os.getenv('DAILY_SUMMARY_MINUTE', '55'))
+# Position sizing: เลือกได้ 2 โหมด
+FIXED_NOTIONAL_USDT = 0.0   # ถ้า > 0 จะใช้จำนวน USDT ต่อไม้เป็นค่าคงที่ (เช่น 1.5)
+RISK_PER_TRADE = 0.01       # ถ้า FIXED_NOTIONAL_USDT == 0.0 จะใช้ % ของ Equity (เช่น 0.01 = 1%)
 
-# Strategy params
+MAX_TRADES_PER_DAY = 20
+STOP_AFTER_SL_STREAK = 5    # SL ติดกัน 5 ครั้ง -> หยุดทั้งวัน
+
+DAILY_SUMMARY_HOUR = 23
+DAILY_SUMMARY_MINUTE = 55
+
+# Indicators
 EMA_FAST = 9
 EMA_SLOW = 21
 EMA_TREND = 50
 ATR_PERIOD = 14
 
-# Filters
-EMA_GAP_MAX = 0.001   # 0.10%
-ATR_PCT_MIN = 0.002   # 0.20%
-ATR_PCT_MAX = 0.008   # 0.80%
-EMA50_SLOPE_MAX = 0.0003  # ~0.03% per bar
+# Filters (Safe Mode)
+EMA_GAP_MAX = 0.001     # 0.10%
+ATR_PCT_MIN = 0.002     # 0.20%
+ATR_PCT_MAX = 0.008     # 0.80%
+EMA50_SLOPE_MAX = 0.0003  # ~0.03%/bar
 
-# Entry/Exit params (in ATR units)
-EXTENSION_ATR = 0.35      # price extends this far beyond EMA9
+# Entry/Exit in ATR units
+EXTENSION_ATR = 0.35
 TP_ATR = 0.25
 SL_ATR = 0.55
 DCA_TRIGGER_ATR = 0.30
@@ -77,19 +74,25 @@ BANGKOK = pytz.timezone('Asia/Bangkok')
 STATE = {
     "today": None,
     "trades_today": 0,
-    "summary": {
-        "wins": 0, "losses": 0, "closed_pnl_usdt": 0.0, "trades": 0
-    },
+    "loss_streak": 0,
+    "halt_for_today": False,
+    "summary": {"wins":0, "losses":0, "closed_pnl_usdt":0.0, "trades":0},
     "sent_summary_for": None,
+    # active position
+    "active_symbol": None,
+    "entry_side": None,         # "long"/"short"
+    "entry_price_1": None,
+    "entry_amount": 0.0,
+    "safety_used": False,
+    "sl_price": None,
+    "basket_tp_usdt": None,
 }
 
-# -------------------- Helpers --------------------
+# ======== Utils ========
 def ema(arr, period):
-    if len(arr) < period:
-        return np.array([np.nan] * len(arr))
+    if len(arr) < period: return np.array([np.nan]*len(arr))
     k = 2/(period+1)
-    out = np.zeros_like(arr, dtype=float)
-    out[:] = np.nan
+    out = np.empty_like(arr, dtype=float); out[:] = np.nan
     out[period-1] = np.mean(arr[:period])
     for i in range(period, len(arr)):
         out[i] = arr[i]*k + out[i-1]*(1-k)
@@ -104,43 +107,39 @@ def true_range(h, l, c):
 def atr(h, l, c, period=14):
     tr = true_range(h, l, c)
     out = np.array([np.nan]*len(c), dtype=float)
-    if len(c) < period+1:
-        return out
+    if len(c) < period+1: return out
     out[period] = np.nanmean(tr[1:period+1])
     for i in range(period+1, len(c)):
         out[i] = (out[i-1]*(period-1) + tr[i]) / period
     return out
 
 def telegram_send(text):
-    if not TELEGRAM_TOKEN or TELEGRAM_TOKEN == 'YOUR_TELEGRAM_TOKEN':
-        print("[TELEGRAM] (skip) ", text)
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    if not TELEGRAM_TOKEN:
+        print("[TELEGRAM] (skip) ", text); return
     try:
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode":"HTML"}, timeout=10)
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode":"HTML"},
+            timeout=10
+        )
     except Exception as e:
         print("Telegram error:", e)
 
-def now_bkk():
-    return datetime.now(BANGKOK)
-
-def same_day(a: datetime, b: datetime):
-    return a.date() == b.date()
+def now_bkk(): return datetime.now(BANGKOK)
+def same_day(a,b): return a.date()==b.date()
 
 def ensure_new_day():
-    """Rotate counters if day changed."""
-    global STATE
     n = now_bkk()
     if STATE["today"] is None or not same_day(n, STATE["today"]):
         STATE["today"] = n
         STATE["trades_today"] = 0
-        STATE["summary"] = {"wins":0, "losses":0, "closed_pnl_usdt":0.0, "trades":0}
-        # reset daily summary flag so a new day's summary can be sent
+        STATE["loss_streak"] = 0
+        STATE["halt_for_today"] = False
+        STATE["summary"] = {"wins":0,"losses":0,"closed_pnl_usdt":0.0,"trades":0}
         STATE["sent_summary_for"] = None
 
 def maybe_send_daily_summary(force=False):
-    n = now_bkk()
-    ensure_new_day()
+    n = now_bkk(); ensure_new_day()
     key = n.strftime("%Y-%m-%d")
     should_time = (n.hour == DAILY_SUMMARY_HOUR and n.minute >= DAILY_SUMMARY_MINUTE)
     if force or (should_time and STATE["sent_summary_for"] != key):
@@ -154,10 +153,7 @@ def maybe_send_daily_summary(force=False):
         telegram_send(msg)
         STATE["sent_summary_for"] = key
 
-def amount_to_precision(exchange, symbol, amount):
-    return float(exchange.amount_to_precision(symbol, amount))
-
-# -------------------- Exchange --------------------
+# ======== Exchange helpers ========
 def create_exchange():
     exchange = ccxt.okx({
         "apiKey": API_KEY,
@@ -165,29 +161,27 @@ def create_exchange():
         "password": PASSWORD,
         "enableRateLimit": True,
         "options": {
-            "defaultType": "swap",   # USDT perpetual
-            "positionSide": "net"    # important for Net mode
+            "defaultType": "swap",
+            "positionSide": "net",
         }
     })
     exchange.load_markets()
-    try:
-        # Set isolated margin mode with Net position
-        exchange.set_margin_mode("isolated", SYMBOL, params={"posSide": "net"})
-    except Exception as e:
-        print("Set margin mode failed (continue):", str(e))
-    try:
-        # Set leverage (1 - 125 allowed on OKX futures)
-        exchange.set_leverage(LEVERAGE, SYMBOL, params={"mgnMode": "isolated", "posSide": "net"})
-    except Exception as e:
-        print("Set leverage failed (continue):", str(e))
+    for sym in SYMBOLS:
+        try:
+            exchange.set_margin_mode("isolated", sym, params={"posSide":"net"})
+        except Exception as e:
+            print(f"Set margin mode failed ({sym}):", e)
+        try:
+            exchange.set_leverage(LEVERAGE, sym, params={"mgnMode":"isolated","posSide":"net"})
+        except Exception as e:
+            print(f"Set leverage failed ({sym}):", e)
     return exchange
-# -------------------- Strategy Core --------------------
-def fetch_ohlcv(exchange, symbol, timeframe, limit=200):
-    ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-    o, h, l, c, t = [], [], [], [], []
+
+def fetch_ohlcv(ex, symbol, timeframe, limit=200):
+    ohlcv = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    o,h,l,c,t = [],[],[],[],[]
     for x in ohlcv:
-        t.append(x[0])
-        o.append(x[1]); h.append(x[2]); l.append(x[3]); c.append(x[4])
+        t.append(x[0]); o.append(x[1]); h.append(x[2]); l.append(x[3]); c.append(x[4])
     return {
         "ts": np.array(t, dtype=np.int64),
         "open": np.array(o, dtype=float),
@@ -197,215 +191,245 @@ def fetch_ohlcv(exchange, symbol, timeframe, limit=200):
     }
 
 def indicators(data):
-    c = data["close"]; h = data["high"]; l = data["low"]
-    e9 = ema(c, EMA_FAST)
-    e21 = ema(c, EMA_SLOW)
-    e50 = ema(c, EMA_TREND)
+    c,h,l = data["close"], data["high"], data["low"]
+    e9 = ema(c, EMA_FAST); e21 = ema(c, EMA_SLOW); e50 = ema(c, EMA_TREND)
     a = atr(h, l, c, ATR_PERIOD)
     return e9, e21, e50, a
 
-def sideway_filter(e9, e21, e50, atr_vals, c):
-    i = -1
-    if any(map(lambda arr: len(arr) < 2 or np.isnan(arr[i]), [e9,e21,e50,atr_vals])):
-        return False
+def sideway_filter(e9,e21,e50,a,c):
+    i=-1
+    if any(len(arr)<2 or np.isnan(arr[i]) for arr in [e9,e21,e50,a]): return False
     price = c[i]
-    gap = abs(e9[i] - e21[i]) / price               # EMA9-21 gap %
-    atr_pct = atr_vals[i] / price                    # ATR %
-    slope = abs(e50[i] - e50[i-1]) / price          # EMA50 slope ~%
-    return (gap <= EMA_GAP_MAX) and (ATR_PCT_MIN <= atr_pct <= ATR_PCT_MAX) and (slope <= EMA50_SLOPE_MAX)
+    gap   = abs(e9[i]-e21[i])/price
+    atrp  = a[i]/price
+    slope = abs(e50[i]-e50[i-1])/price
+    return (gap<=EMA_GAP_MAX) and (ATR_PCT_MIN<=atrp<=ATR_PCT_MAX) and (slope<=EMA50_SLOPE_MAX)
 
-def generate_signal(e9, atr_vals, c):
-    i = -1
-    if np.isnan(e9[i]) or np.isnan(atr_vals[i]):
-        return None
-    price = c[i]
-    prev_price = c[i-1]
-    prev_e9 = e9[i-1]
-    # Long: price extended below EMA9 and closed back above EMA9
-    if prev_price < (prev_e9 - EXTENSION_ATR * atr_vals[i-1]) and price > e9[i]:
+def generate_signal(e9,a,c):
+    i=-1
+    if np.isnan(e9[i]) or np.isnan(a[i]): return None
+    price = c[i]; prev_price = c[i-1]; prev_e9 = e9[i-1]
+    if prev_price < (prev_e9 - EXTENSION_ATR*a[i-1]) and price > e9[i]:
         return "long"
-    # Short: extended above and close back below
-    if prev_price > (prev_e9 + EXTENSION_ATR * atr_vals[i-1]) and price < e9[i]:
+    if prev_price > (prev_e9 + EXTENSION_ATR*a[i-1]) and price < e9[i]:
         return "short"
     return None
 
-# -------------------- Position & Orders --------------------
-def get_equity_usdt(exchange):
-    bal = exchange.fetch_balance(params={"type":"swap"})
+def get_equity_usdt(ex):
+    bal = ex.fetch_balance(params={"type":"swap"})
     usdt = bal.get("USDT", {})
-    eq = usdt.get("total", None)
+    eq = usdt.get("total")
     if eq is None:
-        # fallback to info
-        try:
-            eq = float(usdt.get("info", {}).get("eq", 0))
-        except Exception:
-            eq = 0
+        try: eq = float(usdt.get("info", {}).get("eq", 0))
+        except: eq = 0
     return float(eq or 0.0)
 
-def position_size_from_risk(exchange, symbol, side, entry_price, sl_price, risk_fraction):
-    equity = max(get_equity_usdt(exchange), 30.0)  # guard for start
-    risk_usdt = equity * risk_fraction
-    move_pct = abs(sl_price - entry_price) / entry_price
-    if move_pct <= 0:
-        return 0.0
-    notional = risk_usdt / move_pct  # position value in USDT
-    amount_base = notional / entry_price
-    amount_base = amount_to_precision(exchange, symbol, amount_base)
-    return amount_base
+def amount_to_precision(ex, symbol, amount):
+    return float(ex.amount_to_precision(symbol, amount))
 
-def fetch_ticker_price(exchange, symbol):
-    t = exchange.fetch_ticker(symbol)
+def enforce_min_amount(ex, symbol, amount):
+    m = ex.market(symbol)
+    try:
+        min_amt = m.get('limits', {}).get('amount', {}).get('min', None)
+        if min_amt is None: return amount
+        return max(float(min_amt), float(amount))
+    except:
+        return amount
+
+def ticker(ex, symbol):
+    t = ex.fetch_ticker(symbol)
     return float(t['last'])
 
-def close_all_positions(exchange, symbol):
-    # market-close by placing opposite side with size
-    positions = exchange.fetch_positions([symbol])
+def fetch_positions_map(ex, symbols):
+    pos_list = ex.fetch_positions(symbols)
+    mp = {s: None for s in symbols}
+    for p in pos_list:
+        sym = p.get('symbol')
+        if sym in mp:
+            amt = float(p.get('contracts') or p.get('size') or 0)
+            if amt != 0: mp[sym] = p
+    return mp
+
+def unrealized_pnl_usdt(pos):
+    if not pos: return 0.0
+    try: return float(pos.get('unrealizedPnl', 0.0))
+    except: return 0.0
+
+def close_all_positions(ex, symbol):
+    positions = ex.fetch_positions([symbol])
     for p in positions:
-        if p.get('symbol') != symbol:
-            continue
-        # ccxt okx normalizes either 'contracts' or 'size'
+        if p.get('symbol') != symbol: continue
         amt = float(p.get('contracts') or p.get('size') or 0)
         side = (p.get('side') or '').lower()
         if amt and side:
             try:
-                if side == 'long':
-                    exchange.create_order(symbol, 'market', 'sell', amt)
-                else:
-                    exchange.create_order(symbol, 'market', 'buy', amt)
+                if side == 'long': ex.create_order(symbol, 'market', 'sell', amt)
+                else: ex.create_order(symbol, 'market', 'buy', amt)
             except Exception as e:
                 print("close_all error:", e)
 
-def get_open_position(exchange, symbol):
-    positions = exchange.fetch_positions([symbol])
-    for p in positions:
-        if p.get('symbol') == symbol:
-            amt = float(p.get('contracts') or p.get('size') or 0)
-            if amt != 0:
-                return p
-    return None
+# ======== Ranking ========
+def pick_best_candidate(candidates):
+    # Rank A: lowest ATR (safest)
+    if not candidates: return None
+    return min(candidates, key=lambda x: x["atr"])
 
-def unrealized_pnl_usdt(pos):
-    if not pos:
-        return 0.0
-    # ccxt normalized okx uses 'unrealizedPnl' USDT
-    try:
-        return float(pos.get('unrealizedPnl', 0.0))
-    except Exception:
-        return 0.0
-
-# -------------------- Main loop --------------------
+# ======== Main Loop ========
 def run():
-    exchange = create_exchange()
-    print("Markets loaded. Running strategy on", SYMBOL, TIMEFRAME)
+    ex = create_exchange()
+    print("Markets loaded. Multi-symbol on", SYMBOLS, TIMEFRAME)
     ensure_new_day()
-
-    safety_used = False
-    entry_price_1 = None
-    entry_side = None
-    entry_amount = 0.0
-    basket_tp_usdt = None
-    sl_price = None
 
     while True:
         try:
             ensure_new_day()
-            # send summary if time
-            maybe_send_daily_summary(force=False)
+            maybe_send_daily_summary(False)
 
-            if STATE["trades_today"] >= MAX_TRADES_PER_DAY:
-                time.sleep(POLL_SECONDS)
-                continue
+            # Halt condition (after 5 SLs)
+            if STATE["halt_for_today"]:
+                time.sleep(POLL_SECONDS); continue
 
-            data = fetch_ohlcv(exchange, SYMBOL, TIMEFRAME, limit=ATR_PERIOD*4 + EMA_TREND + 5)
-            c = data["close"]; h=data["high"]; l=data["low"]
-            e9,e21,e50,a = indicators(data)
-            if not sideway_filter(e9,e21,e50,a,c):
-                time.sleep(POLL_SECONDS)
-                continue
+            # Active position?
+            pos_map = fetch_positions_map(ex, SYMBOLS)
+            active = None
+            for sym, p in pos_map.items():
+                if p is not None:
+                    active = sym; break
 
-            sig = generate_signal(e9,a,c)
-            if sig and get_open_position(exchange, SYMBOL) is None:
-                # Determine entry
-                price = fetch_ticker_price(exchange, SYMBOL)
+            # If have active position -> manage it
+            if active or STATE["active_symbol"]:
+                symbol = active or STATE["active_symbol"]
+                if STATE["active_symbol"] is None:
+                    STATE["active_symbol"] = symbol
 
-                # compute TP/SL absolute
-                atr_val = a[-1]
-                if math.isnan(atr_val) or atr_val <= 0:
-                    time.sleep(POLL_SECONDS); continue
+                price = ticker(ex, symbol)
 
-                if sig == "long":
-                    tp_price = price + TP_ATR * atr_val
-                    sl_price = price - SL_ATR * atr_val
-                    side = 'buy'
-                else:
-                    tp_price = price - TP_ATR * atr_val
-                    sl_price = price + SL_ATR * atr_val
-                    side = 'sell'
+                # DCA one time
+                if (not STATE["safety_used"]) and (STATE["entry_price_1"] is not None):
+                    data = fetch_ohlcv(ex, symbol, TIMEFRAME, limit=EMA_TREND+ATR_PERIOD+5)
+                    e9,e21,e50,a = indicators(data)
+                    if len(a)>0 and not math.isnan(a[-1]):
+                        adverse = (price <= STATE["entry_price_1"] - DCA_TRIGGER_ATR*a[-1]) if STATE["entry_side"]=='long' else (price >= STATE["entry_price_1"] + DCA_TRIGGER_ATR*a[-1])
+                        if adverse:
+                            side2 = 'buy' if STATE["entry_side"]=='long' else 'sell'
+                            try:
+                                ex.create_order(symbol, 'market', side2, STATE["entry_amount"])
+                                STATE["safety_used"] = True
+                            except Exception as e:
+                                print("DCA error:", e)
 
-                # size from risk
-                amt = position_size_from_risk(exchange, SYMBOL, sig, price, sl_price, RISK_PER_TRADE)
-                if amt <= 0:
-                    time.sleep(POLL_SECONDS); continue
-
-                # Send market order
-                exchange.create_order(SYMBOL, 'market', side, amt)
-                STATE["trades_today"] += 1
-                entry_price_1 = price
-                entry_amount = amt
-                entry_side = sig
-                safety_used = False
-                basket_tp_usdt = BASKET_TP_ATR * atr_val * amt * price  # approx in USDT
-                telegram_send(f"🚀 Open {sig.upper()} {SYMBOL}\nAmt: {amt}\nEntry: {price:.2f}\nTP≈{tp_price:.2f} SL≈{sl_price:.2f}")
-
-            # Monitor open position for TP/SL/DCA/Basket TP
-            pos = get_open_position(exchange, SYMBOL)
-            if pos and entry_side:
-                price = fetch_ticker_price(exchange, SYMBOL)
-
-                # DCA if adverse move
-                if not safety_used and entry_price_1 is not None and a[-1] and not math.isnan(a[-1]):
-                    adverse_ok = (price <= entry_price_1 - DCA_TRIGGER_ATR*a[-1]) if entry_side == 'long' else (price >= entry_price_1 + DCA_TRIGGER_ATR*a[-1])
-                    if adverse_ok:
-                        try:
-                            side2 = 'buy' if entry_side == 'long' else 'sell'
-                            exchange.create_order(SYMBOL, 'market', side2, entry_amount)  # same size
-                            safety_used = True
-                            telegram_send(f"🧩 DCA executed on {SYMBOL}. Added {entry_amount}")
-                        except Exception as e:
-                            print("DCA error:", e)
-
-                # Basket TP or SL logic via unrealized PnL
-                pos = get_open_position(exchange, SYMBOL)  # refresh
-                pnl = unrealized_pnl_usdt(pos) if pos else 0.0
-
-                hit_basket_tp = basket_tp_usdt is not None and pnl >= basket_tp_usdt
+                # Check Basket TP or SL
+                pos_map = fetch_positions_map(ex, [symbol])
+                p = pos_map.get(symbol)
+                pnl = unrealized_pnl_usdt(p)
+                hit_basket_tp = (STATE["basket_tp_usdt"] is not None) and (pnl >= STATE["basket_tp_usdt"])
                 hit_sl = False
-                if entry_side == 'long' and sl_price is not None and price <= sl_price:
+                if STATE["entry_side"]=='long' and STATE["sl_price"] is not None and price <= STATE["sl_price"]:
                     hit_sl = True
-                if entry_side == 'short' and sl_price is not None and price >= sl_price:
+                if STATE["entry_side"]=='short' and STATE["sl_price"] is not None and price >= STATE["sl_price"]:
                     hit_sl = True
 
                 if hit_basket_tp or hit_sl:
                     try:
-                        # Close by market
-                        close_all_positions(exchange, SYMBOL)
-                        result = "✅ TP (Basket)" if hit_basket_tp else "🛑 SL"
+                        close_all_positions(ex, symbol)
                         pnl_final = pnl
-                        if pnl_final >= 0: STATE["summary"]["wins"] += 1
-                        else: STATE["summary"]["losses"] += 1
                         STATE["summary"]["trades"] += 1
                         STATE["summary"]["closed_pnl_usdt"] += pnl_final
-                        telegram_send(f"{result} {SYMBOL}\nPNL: {pnl_final:.2f} USDT")
+                        if hit_basket_tp:
+                            STATE["summary"]["wins"] += 1
+                            STATE["loss_streak"] = 0
+                        else:
+                            STATE["summary"]["losses"] += 1
+                            STATE["loss_streak"] += 1
+                            # check halt
+                            if STATE["loss_streak"] >= STOP_AFTER_SL_STREAK:
+                                STATE["halt_for_today"] = True
+                                telegram_send(f"🛑 Halted for today: SL streak {STATE['loss_streak']}. Trading paused until tomorrow.")
                     except Exception as e:
                         print("Close error:", e)
                     finally:
-                        # reset
-                        safety_used = False
-                        entry_price_1 = None
-                        entry_side = None
-                        entry_amount = 0.0
-                        basket_tp_usdt = None
-                        sl_price = None
+                        # reset active
+                        STATE.update({
+                            "active_symbol": None,
+                            "entry_side": None,
+                            "entry_price_1": None,
+                            "entry_amount": 0.0,
+                            "safety_used": False,
+                            "sl_price": None,
+                            "basket_tp_usdt": None,
+                        })
+
+                time.sleep(POLL_SECONDS)
+                continue
+
+            # No active position -> scan new signals (respect daily limits)
+            if STATE["trades_today"] >= MAX_TRADES_PER_DAY:
+                time.sleep(POLL_SECONDS); continue
+
+            candidates = []
+            for sym in SYMBOLS:
+                try:
+                    data = fetch_ohlcv(ex, sym, TIMEFRAME, limit=ATR_PERIOD*4 + EMA_TREND + 5)
+                    c = data["close"]; h=data["high"]; l=data["low"]
+                    e9,e21,e50,a = indicators(data)
+                    if not sideway_filter(e9,e21,e50,a,c): 
+                        continue
+                    sig = generate_signal(e9,a,c)
+                    if not sig: 
+                        continue
+                    price = ticker(ex, sym)
+                    atr_val = a[-1]
+                    if math.isnan(atr_val) or atr_val <= 0: 
+                        continue
+                    candidates.append({"symbol": sym, "signal": sig, "atr": atr_val, "price": price})
+                except Exception as e:
+                    print(f"Scan error {sym}:", e)
+
+            best = pick_best_candidate(candidates)  # Rank A
+            if best is None:
+                time.sleep(POLL_SECONDS); continue
+
+            symbol = best["symbol"]; sig = best["signal"]; price = best["price"]; atr_val = best["atr"]
+
+            # SL absolute (TP ใช้ basket/logic)
+            if sig == "long":
+                sl_price = price - SL_ATR * atr_val
+                side = 'buy'
+            else:
+                sl_price = price + SL_ATR * atr_val
+                side = 'sell'
+
+            # Sizing
+            if FIXED_NOTIONAL_USDT > 0:
+                notional = FIXED_NOTIONAL_USDT
+            else:
+                equity = max(get_equity_usdt(ex), 10.0)
+                move_pct = abs(sl_price - price) / price
+                if move_pct <= 0:
+                    time.sleep(POLL_SECONDS); continue
+                notional = equity * RISK_PER_TRADE  # ความเสี่ยง (USDT) = notional * move_pct  -> notional = risk/move_pct
+                notional = notional / max(move_pct, 1e-9)
+
+            amount_base = notional / price
+            amount_base = amount_to_precision(ex, symbol, amount_base)
+            amount_base = enforce_min_amount(ex, symbol, amount_base)
+            if amount_base <= 0:
+                time.sleep(POLL_SECONDS); continue
+
+            try:
+                ex.create_order(symbol, 'market', side, amount_base)
+                STATE["trades_today"] += 1
+                STATE.update({
+                    "active_symbol": symbol,
+                    "entry_side": sig,
+                    "entry_price_1": price,
+                    "entry_amount": amount_base,
+                    "safety_used": False,
+                    "sl_price": sl_price,
+                    "basket_tp_usdt": BASKET_TP_ATR * atr_val * amount_base * price,
+                })
+            except Exception as e:
+                print("Open order error:", e)
 
             time.sleep(POLL_SECONDS)
 
