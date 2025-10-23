@@ -2,23 +2,13 @@
 # -*- coding: utf-8 -*-
 
 """
-ETH Ladder EA — EMA 9/21 Cross + EMA50 Filter + ATR Filter
-Basket TP/SL: +5% / -5% of equity per set (RR ≈ 1:1)
-Auto Portfolio Growth Ladder (max 4 legs):
-  20–39:  1 × 15 USDT
-  40–59:  2 × 15 USDT
-  60–79:  3 × 15 USDT
-  80–99:  4 × 15 USDT
-  100–199: 4 × 20 USDT
-  200–299: 4 × 30 USDT
-  300–399: 4 × 40 USDT
-  400–499: 4 × 50 USDT
-(ขยายขั้นบันไดต่อไปได้)
+ETH Ladder EA — FINAL v2
+OKX Futures (swap) • Isolated + Net • Leverage 25x • TF 5m
 
-- Single Position (เปิดได้ชุดเดียวต่อครั้ง, เพิ่มไม้ฝั่งเดียวกันเท่านั้น)
-- OKX Futures: Isolated + Net, Leverage 25x
-- Timeframe 5m
-- Daily Telegram summary 23:55
+สัญญาณเข้า: EMA 9/21 Cross + EMA50 ทิศทาง + ATR% filter
+พอร์ตโตตามขั้นบันได (max 4 ไม้): 20/40/60/80/100/200/300/400 … ตามตาราง
+Basket Target/Stop: +5% / -5% ของ Equity เมื่อเริ่มชุด (RR ≈ 1:1)
+Single Position (เปิดได้ชุดเดียวต่อครั้ง) • Daily summary 23:55 (Telegram)
 
 ENV REQUIRED:
   OKX_API_KEY, OKX_SECRET, OKX_PASSWORD
@@ -31,7 +21,7 @@ import pytz, requests
 import numpy as np
 import ccxt
 
-# ====== ENV (เฉพาะ Exchange + Telegram) ======
+# ====== ENV (Exchange + Telegram) ======
 API_KEY = os.getenv('OKX_API_KEY', '')
 SECRET = os.getenv('OKX_SECRET', '')
 PASSWORD = os.getenv('OKX_PASSWORD', '')
@@ -39,23 +29,23 @@ TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', '')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
 
 # ====== SETTINGS ======
-SYMBOL = "ETH-USDT-SWAP"
+SYMBOL = "ETH-USDT-SWAP"      # << ใช้ฟอร์แมตของ OKX Futures (สำคัญ)
 TIMEFRAME = "5m"
 LEVERAGE = 25
-MARGIN_MODE = "isolated"
+MARGIN_MODE = "isolated"      # Isolated + Net
 POLL_SECONDS = 5
 
 # Signal filters
 EMA_FAST, EMA_SLOW, EMA_TREND = 9, 21, 50
 ATR_PERIOD = 14
-ATR_PCT_MIN, ATR_PCT_MAX = 0.0015, 0.01  # 0.15%–1.0% of price (TF 5m กลางๆ)
+ATR_PCT_MIN, ATR_PCT_MAX = 0.0015, 0.01   # 0.15%–1.0%
+
+# Basket target/stop ต่อ “ชุด”
+BASKET_TARGET_PCT = 0.05  # +5%
+BASKET_STOP_PCT   = 0.05  # -5%
 BANGKOK = pytz.timezone('Asia/Bangkok')
 
-# Basket risk/target (ต่อชุด)
-BASKET_TARGET_PCT = 0.05  # +5% ของ equity ตอนเริ่มชุด
-BASKET_STOP_PCT   = 0.05  # -5% ของ equity ตอนเริ่มชุด
-
-# Daily summary
+# Daily summary (สรุปรายวัน)
 DAILY_SUMMARY_HOUR = 23
 DAILY_SUMMARY_MINUTE = 55
 
@@ -64,17 +54,17 @@ STATE = {
     "summary": {"wins":0, "losses":0, "trades":0, "closed_pnl_usdt":0.0},
     "sent_summary_for": None,
 
-    # Active basket
+    # Active basket (ชุดปัจจุบัน)
     "active_side": None,           # "long"/"short"
     "legs_opened": 0,              # 0..4
-    "leg_amounts": [],             # amounts in base (ETH)
+    "leg_amounts": [],             # base amounts (ETH)
     "basket_equity_start": None,   # equity USDT ตอนเริ่มชุด
-    "basket_equity_high": None,    # ใช้ต่อยอดภายหลังได้ (ถ้าจะทำ trailing)
 }
 
 # ====== Utils ======
 def telegram_send(text):
-    if not TELEGRAM_TOKEN: print("[TELEGRAM] (skip)", text); return
+    if not TELEGRAM_TOKEN:
+        print("[TELEGRAM] (skip)", text); return
     try:
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
@@ -97,18 +87,16 @@ def ensure_new_day():
 def maybe_send_daily_summary(force=False):
     n = now_bkk(); ensure_new_day()
     key = n.strftime("%Y-%m-%d")
-    should_time = (n.hour==DAILY_SUMMARY_HOUR and n.minute>=DAILY_SUMMARY_MINUTE)
-    if force or (should_time and STATE["sent_summary_for"] != key):
+    if force or (n.hour==DAILY_SUMMARY_HOUR and n.minute>=DAILY_SUMMARY_MINUTE and STATE["sent_summary_for"]!=key):
         s = STATE["summary"]
-        msg = (
-            f"📊 <b>Daily Summary</b> ({key})\n"
-            f"Trades: {s['trades']}\n"
-            f"Wins: {s['wins']}  Losses: {s['losses']}\n"
-            f"PNL: {s['closed_pnl_usdt']:.2f} USDT\n"
-        )
+        msg = (f"📊 <b>Daily Summary</b> ({key})\n"
+               f"Trades: {s['trades']}\n"
+               f"Wins: {s['wins']}  Losses: {s['losses']}\n"
+               f"PNL: {s['closed_pnl_usdt']:.2f} USDT\n")
         telegram_send(msg)
         STATE["sent_summary_for"] = key
 
+# ====== Indicators ======
 def ema(arr, period):
     if len(arr) < period: return np.array([np.nan]*len(arr))
     k = 2/(period+1)
@@ -133,7 +121,7 @@ def atr(h,l,c,period=14):
         out[i] = (out[i-1]*(period-1) + tr[i]) / period
     return out
 
-# ====== Exchange ======
+# ====== Exchange / Market ======
 def create_exchange():
     ex = ccxt.okx({
         "apiKey": API_KEY,
@@ -167,10 +155,10 @@ def enforce_min_amount(ex, symbol, amount):
 
 def fetch_ohlcv(ex, symbol, timeframe, limit=200):
     ohlcv = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-    o,h,l,c,t=[],[],[],[],[]
+    o,h,l,c = [],[],[],[]
     for x in ohlcv:
-        t.append(x[0]); o.append(x[1]); h.append(x[2]); l.append(x[3]); c.append(x[4])
-    return {"ts":np.array(t), "open":np.array(o), "high":np.array(h), "low":np.array(l), "close":np.array(c)}
+        o.append(x[1]); h.append(x[2]); l.append(x[3]); c.append(x[4])
+    return {"open":np.array(o), "high":np.array(h), "low":np.array(l), "close":np.array(c)}
 
 def fetch_balance_equity_usdt(ex):
     bal = ex.fetch_balance(params={"type":"swap"})
@@ -184,19 +172,17 @@ def fetch_balance_equity_usdt(ex):
 def fetch_positions(ex):
     ps = ex.fetch_positions([SYMBOL])
     for p in ps:
-        if p.get('symbol')==SYMBOL:
+        if p.get('symbol') == SYMBOL:
             amt = float(p.get('contracts') or p.get('size') or 0)
             side = (p.get('side') or '').lower()
-            return amt, side if amt!=0 else (0.0, None)
+            return amt, (side if amt!=0 else None)
     return 0.0, None
 
 def ticker_price(ex):
     return float(ex.fetch_ticker(SYMBOL)['last'])
 
 def place_market_with_retries(ex, side, amount):
-    """
-    ลดขนาดครึ่งหนึ่งอัตโนมัติเมื่อ margin ไม่พอ จนถึง min-amount
-    """
+    """ลดขนาดครึ่งหนึ่งอัตโนมัติเมื่อ margin ไม่พอ จนถึง min-amount"""
     amount = amount_to_precision(ex, SYMBOL, amount)
     amount = enforce_min_amount(ex, SYMBOL, amount)
     while amount > 0:
@@ -244,18 +230,15 @@ def atr_ok(a, c):
     price = float(c[i]); atrp = a[i]/price
     return (ATR_PCT_MIN <= atrp <= ATR_PCT_MAX)
 
-def cross_up(e9,e21):  return (e9[-2] <= e21[-2]) and (e9[-1] > e21[-1])
-def cross_down(e9,e21):return (e9[-2] >= e21[-2]) and (e9[-1] < e21[-1])
+def cross_up(e9,e21):   return (e9[-2] <= e21[-2]) and (e9[-1] > e21[-1])
+def cross_down(e9,e21): return (e9[-2] >= e21[-2]) and (e9[-1] < e21[-1])
 
 def entry_signal(c,e9,e21,e50,a):
     i=-1
     if any(np.isnan(x[i]) for x in [e9,e21,e50,a]): return None
     if not atr_ok(a,c): return None
-    # Cross + EMA50 direction filter
-    if cross_up(e9,e21) and c[i] > e50[i]:
-        return "long"
-    if cross_down(e9,e21) and c[i] < e50[i]:
-        return "short"
+    if cross_up(e9,e21) and c[i] > e50[i]:   return "long"
+    if cross_down(e9,e21) and c[i] < e50[i]: return "short"
     return None
 
 def add_leg_signal(c,e9,e21, side):
@@ -272,7 +255,6 @@ def add_leg_signal(c,e9,e21, side):
 def basket_open(ex):
     eq = fetch_balance_equity_usdt(ex)
     STATE["basket_equity_start"] = eq
-    STATE["basket_equity_high"] = eq
 
 def basket_should_close(ex):
     if STATE["basket_equity_start"] is None: return None
@@ -290,7 +272,6 @@ def reset_basket_state():
         "legs_opened": 0,
         "leg_amounts": [],
         "basket_equity_start": None,
-        "basket_equity_high": None,
     })
 
 # ====== Main ======
@@ -306,18 +287,20 @@ def run():
 
             data = fetch_ohlcv(ex, SYMBOL, TIMEFRAME, limit=EMA_TREND+ATR_PERIOD+10)
             c,e9,e21,e50,a = compute_indicators(data)
-            if len(c) < EMA_TREND+ATR_PERIOD: time.sleep(POLL_SECONDS); continue
+            if len(c) < EMA_TREND+ATR_PERIOD:
+                time.sleep(POLL_SECONDS); continue
 
-            # Check basket exit
+            # Basket exit check
             if STATE["active_side"]:
                 res = basket_should_close(ex)
                 if res:
                     typ, pnl = res
-                    # Close all market
+                    # Close all
                     amt, side_on_ex = fetch_positions(ex)
                     if amt and side_on_ex:
                         try:
-                            ex.create_order(SYMBOL, 'market', ('sell' if STATE["active_side"]=='long' else 'buy'), amt)
+                            ex.create_order(SYMBOL, 'market',
+                                ('sell' if STATE["active_side"]=='long' else 'buy'), amt)
                         except Exception as e:
                             print("Close basket error:", e)
                     # summary
@@ -339,7 +322,7 @@ def run():
                     if leg_usdt <= 0 or max_legs == 0:
                         time.sleep(POLL_SECONDS); continue
                     price = ticker_price(ex)
-                    amount = leg_usdt / price
+                    amount = max(leg_usdt / price, 0.0)
                     amount = amount_to_precision(ex, SYMBOL, amount)
                     amount = enforce_min_amount(ex, SYMBOL, amount)
                     side = 'buy' if sig=='long' else 'sell'
@@ -358,7 +341,7 @@ def run():
                 leg_usdt, max_legs = ladder_leg_usdt_and_max_legs(equity)
                 if STATE["legs_opened"] < max_legs and add_leg_signal(c,e9,e21, STATE["active_side"]):
                     price = ticker_price(ex)
-                    amount = leg_usdt / price
+                    amount = max(leg_usdt / price, 0.0)
                     amount = amount_to_precision(ex, SYMBOL, amount)
                     amount = enforce_min_amount(ex, SYMBOL, amount)
                     side = 'buy' if STATE["active_side"]=='long' else 'sell'
