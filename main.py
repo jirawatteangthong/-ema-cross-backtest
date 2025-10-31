@@ -1,279 +1,466 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+# main.py
+# OKX M15 Bot — EMA50/100 Trend + Nadaraya-Watson Envelope
+# Single-file version. Edit config section below as needed.
+# .env must contain OKX_API_KEY, OKX_SECRET, OKX_PASSWORD, (optional) TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
 
-"""
-MINI EMA Bot — OKX Futures (One-way/Cross) — ETH-USDT-SWAP
-TF: 5m | Entry: EMA 9/21 cross | TP/SL: ±5% (RR 1:1)
-Lot: fixed 15 USDT per trade
-Notify: Telegram only on start + open-fail (once), and Daily Summary 23:55
-"""
-
-import os, time, math, traceback
+import os, time, json, logging, math
+from dataclasses import dataclass
 from datetime import datetime
-import pytz, requests
-import numpy as np
+import requests
 import ccxt
+from dotenv import load_dotenv
 
-# ====== ENV ======
-API_KEY = os.getenv('OKX_API_KEY', '')
-SECRET = os.getenv('OKX_SECRET', '')
-PASSWORD = os.getenv('OKX_PASSWORD', '')
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', '')
-TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
+load_dotenv(override=True)
 
-# ====== CONFIG ======
-SYMBOL = "ETH-USDT-SWAP"
-TIMEFRAME = "5m"
-LEVERAGE = 25
-MARGIN_MODE = "cross"     # cross = เปิดง่ายสุด
-POSITION_SIDE = "net"     # one-way
-LOOP_SLEEP = 5            # seconds
-LOT_USDT = 15.0           # notional per order (fixed)
-TP_PCT = 0.05             # +5%
-SL_PCT = 0.05             # -5%
+# ========== ENV (from .env) ==========
+API_KEY   = os.getenv('OKX_API_KEY', 'YOUR_OKX_API_KEY')
+SECRET    = os.getenv('OKX_SECRET', 'YOUR_OKX_SECRET')
+PASSWORD  = os.getenv('OKX_PASSWORD', 'YOUR_OKX_PASSPHRASE')
 
-# Summary time (Bangkok)
-BKK = pytz.timezone('Asia/Bangkok')
-DAILY_SUMMARY_HOUR = 23
-DAILY_SUMMARY_MINUTE = 55
+TELEGRAM_TOKEN   = os.getenv('TELEGRAM_TOKEN', 'YOUR_TELEGRAM_TOKEN')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', 'YOUR_CHAT_ID')
 
-# ====== STATE ======
-STATE = {
-    "today": None,
-    "sent_summary_for": None,
-    "open_fail_notified_for": None,   # date string when last fail notified
-    "summary": {"trades":0, "wins":0, "losses":0, "tp":0, "sl":0, "pnl":0.0},
-    # position
-    "side": None,         # "long"/"short"
-    "entry": None,        # float
-    "size": 0.0,          # amount in base (ETH)
-    "tp_price": None,
-    "sl_price": None,
-}
+# ========== CONFIG (แก้ในนี้ได้เลย) ==========
+SYMBOL_ID    = "BTC-USDT-SWAP"   # OKX swap instrument id
+TIMEFRAME    = "15m"
+LEVERAGE     = 15
+MARGIN_MODE  = "isolated"        # 'isolated' or 'cross'
 
-# ====== Utils ======
-def now_bkk(): return datetime.now(BKK)
-def same_day(a,b): return a.date()==b.date()
+POSITION_MARGIN_FRACTION = 0.50   # ใช้ 50% ของ free USDT เป็น margin ต่อไม้
 
-def telegram(text):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: 
-        print("[TG] (skip) " + text); return
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode":"HTML"},
-            timeout=10
-        )
-    except Exception as e:
-        print("Telegram error:", e)
+EMA_FAST = 50
+EMA_SLOW = 100
 
-def ensure_new_day():
-    n = now_bkk()
-    if STATE["today"] is None or not same_day(n, STATE["today"]):
-        STATE["today"] = n
-        STATE["sent_summary_for"] = None
-        STATE["open_fail_notified_for"] = None
-        STATE["summary"] = {"trades":0, "wins":0, "losses":0, "tp":0, "sl":0, "pnl":0.0}
+# Nadaraya-Watson Envelope params
+NW_BANDWIDTH = 8.0
+NW_MULT      = 3.0
+NW_LOOKBACK  = 500   # ต้องมีอย่างน้อย win+1 closed bars
 
-def maybe_send_daily_summary():
-    n = now_bkk(); ensure_new_day()
-    key = n.strftime("%Y-%m-%d")
-    if (n.hour==DAILY_SUMMARY_HOUR and n.minute>=DAILY_SUMMARY_MINUTE and STATE["sent_summary_for"] != key):
-        s = STATE["summary"]
-        winrate = (s["wins"]/s["trades"]*100.0) if s["trades"]>0 else 0.0
-        msg = (f"📊 <b>Daily Summary ({key})</b>\n"
-               f"Pair: ETH-USDT-SWAP\n"
-               f"Timeframe: 5m\n"
-               f"Trades: {s['trades']}\n"
-               f"Wins: {s['wins']}\n"
-               f"Loss: {s['losses']}\n"
-               f"Winrate: {winrate:.0f}%\n"
-               f"TP: {s['tp']} ครั้ง\n"
-               f"SL: {s['sl']} ครั้ง\n"
-               f"PNL: {s['pnl']:+.2f} USDT\n"
-               f"Status: Bot Running ✅")
-        telegram(msg)
-        STATE["sent_summary_for"] = key
+# SL / points (fixed distance from entry)
+SL_POINTS = 300.0    # เช่น entry 114500 -> SL long = 114200 ; short = entry + SL_POINTS
 
-# ====== Indicators ======
-def ema(arr, period):
-    if len(arr) < period: return np.array([np.nan]*len(arr))
-    k = 2/(period+1)
-    out = np.empty_like(arr, dtype=float); out[:] = np.nan
-    out[period-1] = np.mean(arr[:period])
-    for i in range(period, len(arr)):
-        out[i] = arr[i]*k + out[i-1]*(1-k)
+# Behavior
+# เมื่อโดน SL -> sl_lock_active True; ปลดล็อกเมื่อมีแท่งปิด (closed bar) อยู่ใน zone (between lower & upper)
+# หลังปลดล็อก ให้หาสัญญาณตาม EMA ปัจจุบันได้เลย (ไม่ต้องรอ cross ใหม่)
+
+LOOP_SECONDS = 3
+LOG_FILE = "bot.log"
+STATS_FILE = "daily_stats.json"
+DAILY_REPORT_HH = 23
+DAILY_REPORT_MM = 59
+
+# ========== logging ==========
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s - %(levelname)s - %(message)s",
+                    handlers=[logging.StreamHandler(), logging.FileHandler(LOG_FILE, encoding="utf-8")])
+log = logging.getLogger("okx.m15.bot")
+
+# ========== Helpers: EMA, Nadaraya ==========
+def ema_series(values, period: int):
+    n = int(period)
+    if not values or len(values) < n:
+        return None
+    sma = sum(values[:n]) / n
+    k = 2.0 / (n + 1)
+    out = [None] * (n - 1) + [sma]
+    e = sma
+    for v in values[n:]:
+        e = v * k + e * (1 - k)
+        out.append(e)
     return out
 
-def cross_up(e1,e2):   return e1[-2] <= e2[-2] and e1[-1] > e2[-1]
-def cross_down(e1,e2): return e1[-2] >= e2[-2] and e1[-1] < e2[-1]
+def last_ema(values, period: int):
+    es = ema_series(values, period)
+    return es[-1] if es else None
 
-# ====== Exchange ======
-def create_exchange():
-    ex = ccxt.okx({
-        "apiKey": API_KEY,
-        "secret": SECRET,
-        "password": PASSWORD,
-        "enableRateLimit": True,
-        "options": {
-            "defaultType": "swap",
-            "positionSide": POSITION_SIDE,
-        },
-        "timeout": 30000,
-    })
-    markets = ex.load_markets()
-    # Margin/Leverage (cross + one-way)
-    try: ex.set_margin_mode(MARGIN_MODE, SYMBOL)
-    except Exception as e: print("set_margin_mode:", e)
-    try: ex.set_leverage(LEVERAGE, SYMBOL, params={"mgnMode":"cross","posSide":"net"})
-    except Exception as e: print("set_leverage:", e)
-    return ex
+def _gauss(x: float, h: float) -> float:
+    return math.exp(-(x * x) / (2.0 * h * h))
 
-def fetch_ohlcv(ex, limit=200):
-    return ex.fetch_ohlcv(SYMBOL, timeframe=TIMEFRAME, limit=limit)
+def nwe_non_repaint(closes: list, h: float, mult: float, win: int):
+    """
+    closes: list of closed-bar closes (old...latest_closed)
+    requires len(closes) >= win+1
+    returns upper, lower, mid computed for latest closed bar
+    """
+    n = len(closes)
+    if n < win + 1:
+        return None, None, None
+    coefs = [_gauss(i, h) for i in range(win)]
+    den = sum(coefs)
+    s = 0.0
+    # endpoint: use closes[-1 - i]
+    for i in range(win):
+        s += closes[-1 - i] * coefs[i]
+    mid = s / den
+    # mae on window (exclude the endpoint itself as in original)
+    diffs = [abs(closes[-1 - i] - mid) for i in range(1, win + 1)]
+    mae = (sum(diffs) / win) * mult
+    upper = mid + mae
+    lower = mid - mae
+    return upper, lower, mid
 
-def price(ex): 
-    return float(ex.fetch_ticker(SYMBOL)['last'])
-
-def equity_usdt(ex):
-    bal = ex.fetch_balance(params={"type":"swap"})
-    usdt = bal.get("USDT", {})
-    eq = usdt.get("total")
-    if eq is None:
-        try: eq = float(usdt.get("info",{}).get("eq", 0))
-        except: eq = 0
-    return float(eq or 0.0)
-
-def enforce_min_amount(ex, amount):
-    m = ex.market(SYMBOL)
-    min_amt = (m.get('limits',{}).get('amount',{}) or {}).get('min', None)
-    if min_amt is not None and amount < float(min_amt):
-        return float(min_amt)
-    return amount
-
-def open_market(ex, side, notional_usdt):
-    """return order|None"""
-    px = price(ex)
-    amt = max(notional_usdt/px, 0.0)
-    amt = float(ex.amount_to_precision(SYMBOL, amt))
-    amt = enforce_min_amount(ex, amt)
-    if amt <= 0:
-        return None
+# ========== Telegram ==========
+def tg_send(text: str):
+    if not TELEGRAM_TOKEN or TELEGRAM_TOKEN.startswith("YOUR") or not TELEGRAM_CHAT_ID or TELEGRAM_CHAT_ID.startswith("YOUR"):
+        # no creds — do nothing (silent)
+        return
     try:
-        return ex.create_order(SYMBOL, 'market', ('buy' if side=='long' else 'sell'), amt, params={"tdMode":"cross"})
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        requests.get(url, params={'chat_id': TELEGRAM_CHAT_ID, 'text': text, 'parse_mode': 'HTML'}, timeout=10)
     except Exception as e:
-        print("open_market error:", e)
+        log.warning(f"TG error: {e}")
+
+# ========== Stats (daily only) ==========
+class DailyStats:
+    def __init__(self, path=STATS_FILE):
+        self.path = path
+        self.data = {'date': datetime.now().strftime('%Y-%m-%d'), 'trades': [], 'pnl_usdt': 0.0}
+        self._load()
+        self._last_report_key = None
+
+    def _load(self):
+        try:
+            if os.path.exists(self.path):
+                with open(self.path, 'r', encoding='utf-8') as f:
+                    loaded = json.load(f)
+                    if isinstance(loaded, dict):
+                        self.data.update(loaded)
+        except Exception:
+            pass
+
+    def _save(self):
+        try:
+            with open(self.path, 'w', encoding='utf-8') as f:
+                json.dump(self.data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            log.warning(f"save stats error: {e}")
+
+    def roll_if_new_day(self):
+        today = datetime.now().strftime('%Y-%m-%d')
+        if self.data.get('date') != today:
+            # send yesterday report then reset
+            self.send_report(force=True)
+            self.data = {'date': today, 'trades': [], 'pnl_usdt': 0.0}
+            self._save()
+
+    def add_trade(self, side, entry, close, qty, pnl_usdt, reason):
+        rec = {'time': datetime.now().strftime('%H:%M:%S'),
+               'side': side, 'entry': entry, 'close': close, 'qty': qty, 'pnl_usdt': float(pnl_usdt), 'reason': reason}
+        self.data['trades'].append(rec)
+        self.data['pnl_usdt'] = float(self.data.get('pnl_usdt', 0.0)) + float(pnl_usdt)
+        self._save()
+
+    def send_report(self, force=False):
+        now = datetime.now()
+        key = f"{self.data['date']}:{DAILY_REPORT_HH}:{DAILY_REPORT_MM}"
+        if not force:
+            if not (now.hour == DAILY_REPORT_HH and now.minute == DAILY_REPORT_MM):
+                return
+            if self._last_report_key == key:
+                return
+        total = float(self.data.get('pnl_usdt', 0.0))
+        if not self.data['trades'] and total == 0.0 and not force:
+            self._last_report_key = key
+            return
+        lines = [f"📊 <b>สรุปผลรายวัน</b> — {self.data['date']}", f"Σ PnL: <b>{total:+,.2f} USDT</b>"]
+        if self.data['trades']:
+            lines.append("────────────")
+            for t in self.data['trades'][-20:]:
+                lines.append(f"{t['time']} | {t['side'].upper()} | {t['entry']:.2f}→{t['close']:.2f} | {t['pnl_usdt']:+.2f} ({t['reason']})")
+        tg_send("\n".join(lines))
+        self._last_report_key = key
+
+stats = DailyStats()
+
+# ========== Exchange wrapper (OKX) ==========
+class OKX:
+    def __init__(self):
+        self.ex = None
+        self.market = None
+        self.symbol_u = None
+        self.contract_size = 0.01
+
+    def setup(self):
+        if not API_KEY or API_KEY.startswith("YOUR") or not SECRET or SECRET.startswith("YOUR") or not PASSWORD or PASSWORD.startswith("YOUR"):
+            raise RuntimeError("Set OKX_API_KEY / OKX_SECRET / OKX_PASSWORD in .env")
+        self.ex = ccxt.okx({'apiKey': API_KEY, 'secret': SECRET, 'password': PASSWORD, 'enableRateLimit': True, 'options': {'defaultType': 'swap'}})
+        self.ex.load_markets()
+        self.market = self.ex.market(SYMBOL_ID)
+        self.symbol_u = self.market['symbol']
+        self.contract_size = float(self.market.get('contractSize') or 0.01)
+        try:
+            self.ex.set_leverage(LEVERAGE, self.symbol_u, params={'mgnMode': MARGIN_MODE})
+        except Exception as e:
+            log.warning(f"set_leverage warn: {e}")
+
+    def ticker_last(self):
+        return float(self.ex.fetch_ticker(self.symbol_u)['last'])
+
+    def fetch_ohlcv(self, timeframe, limit):
+        return self.ex.fetch_ohlcv(self.symbol_u, timeframe=timeframe, limit=limit)
+
+    def free_usdt(self):
+        try:
+            bal = self.ex.fetch_balance({'type': 'swap'})
+        except Exception:
+            bal = self.ex.fetch_balance()
+        try:
+            data = (bal.get('info', {}).get('data') or [])
+            if data:
+                details = data[0].get('details') or []
+                for d in details:
+                    if d.get('ccy') == 'USDT':
+                        avail = float(d.get('availBal') or 0)
+                        frozen = float(d.get('ordFrozen') or 0)
+                        return max(0.0, avail - frozen)
+        except Exception:
+            pass
+        v = (bal.get('USDT') or {}).get('free')
+        return float(v) if v is not None else 0.0
+
+    def fetch_position(self):
+        ps = self.ex.fetch_positions([self.symbol_u])
+        for p in ps:
+            sym_u = p.get('symbol')
+            instId = (p.get('info') or {}).get('instId')
+            if (sym_u == self.symbol_u) or (instId == self.market['id']):
+                qty = abs(float(p.get('contracts') or 0))
+                if qty != 0:
+                    return {'side': p.get('side'), 'contracts': qty, 'entry': float(p.get('entryPrice') or 0)}
         return None
 
-def close_all(ex, side):
-    try:
-        # reduceOnly market to flatten
-        amt = 0.0
-        pos = ex.fetch_positions([SYMBOL])
-        for p in pos:
-            if p.get('symbol')==SYMBOL:
-                amt = float(p.get('contracts') or p.get('size') or 0)
-                break
-        if amt>0:
-            ex.create_order(SYMBOL, 'market', ('sell' if side=='long' else 'buy'), amt, params={"tdMode":"cross","reduceOnly":True})
-    except Exception as e:
-        print("close_all error:", e)
+    def amount_to_precision(self, qty):
+        try: return float(self.ex.amount_to_precision(self.symbol_u, qty))
+        except Exception: return float(f"{qty:.4f}")
 
-# ====== Main loop ======
+    def contracts_from_notional(self, price, notional):
+        if price <= 0 or self.contract_size <= 0 or notional <= 0:
+            return 0.0
+        qty = notional / (price * self.contract_size)
+        qty = self.amount_to_precision(qty)
+        return 0.0 if qty < 0.01 else qty
+
+    def _market(self, side_ccxt, qty, extra=None):
+        params = dict(extra or {})
+        params.setdefault('tdMode', MARGIN_MODE)
+        params.setdefault('posSide', 'long' if side_ccxt.lower()=='buy' else 'short')
+        try:
+            return self.ex.create_market_order(self.symbol_u, side_ccxt, qty, None, params)
+        except Exception:
+            return self.ex.create_market_order(self.symbol_u, side_ccxt, qty, None, {'tdMode': MARGIN_MODE})
+
+    def open_market(self, side, notional, price_ref):
+        qty = self.contracts_from_notional(price_ref, notional)
+        if qty <= 0: return None
+        self._market('buy' if side == 'long' else 'sell', qty, {})
+        time.sleep(0.6)
+        return self.fetch_position()
+
+    def reduce_only_close(self):
+        pos = self.fetch_position()
+        if not pos: return True
+        side = 'sell' if pos['side'] == 'long' else 'buy'
+        qty = pos['contracts']
+        self._market(side, qty, {'reduceOnly': True})
+        time.sleep(0.8)
+        for _ in range(10):
+            if not self.fetch_position(): break
+            time.sleep(0.3)
+        return self.fetch_position() is None
+
+# ========== Strategy / Risk ==========
+class TrendSide:
+    BUY = "buy"
+    SELL = "sell"
+    NONE = "none"
+
+def trend_from_ema(closes):
+    e_fast = last_ema(closes, EMA_FAST)
+    e_slow = last_ema(closes, EMA_SLOW)
+    if e_fast is None or e_slow is None:
+        return TrendSide.NONE
+    if e_fast > e_slow: return TrendSide.BUY
+    if e_fast < e_slow: return TrendSide.SELL
+    return TrendSide.NONE
+
+@dataclass
+class Bands:
+    upper: float
+    lower: float
+    mid: float
+
+def compute_bands(closes):
+    up, lo, mid = nwe_non_repaint(closes, h=NW_BANDWIDTH, mult=NW_MULT, win=NW_LOOKBACK)
+    if up is None: return None
+    return Bands(upper=up, lower=lo, mid=mid)
+
+def entry_signal(side_allowed, price_now, bands):
+    if side_allowed == TrendSide.BUY and price_now <= bands.lower:
+        return "long"
+    if side_allowed == TrendSide.SELL and price_now >= bands.upper:
+        return "short"
+    return None
+
+def tp_hit(pos_side, price_now, bands):
+    if pos_side == "long":
+        return price_now >= bands.upper
+    else:
+        return price_now <= bands.lower
+
+@dataclass
+class PositionState:
+    side: str
+    entry: float
+    contracts: float
+    cs: float
+    margin_used: float
+    sl_price: float = None
+
+def compute_sl_price(entry_price, side):
+    """SL = entry ± SL_POINTS"""
+    if side == 'long':
+        return entry_price - SL_POINTS
+    else:
+        return entry_price + SL_POINTS
+
+# ========== Runtime vars ==========
+pos_state = None  # PositionState or None
+sl_lock_active = False
+# price_in_zone flag not strictly needed as we check closed bar in loop; keep for clarity
+price_in_zone = False
+
+def open_position(ex, side, price_now):
+    global pos_state, sl_lock_active
+    free = ex.free_usdt()
+    margin = max(0.0, free * POSITION_MARGIN_FRACTION)
+    if margin <= 0:
+        log.info("No free USDT to open.")
+        return False
+    notional = margin * LEVERAGE
+    pos = ex.open_market(side, notional, price_now)
+    if not pos:
+        log.info("Open position failed or not confirmed.")
+        return False
+    # pos: {'side','contracts','entry'}
+    ps = PositionState(side=pos['side'], entry=float(pos['entry']), contracts=float(pos['contracts']),
+                       cs=float(ex.contract_size), margin_used=float(margin))
+    ps.sl_price = compute_sl_price(ps.entry, ps.side)
+    # store
+    global pos_state
+    pos_state = ps
+    log.info(f"OPEN {ps.side.upper()} entry={ps.entry:.2f} size={ps.contracts:.4f} margin={ps.margin_used:.2f} SL={ps.sl_price:.2f}")
+    return True
+
+def close_position(ex, reason):
+    global pos_state, sl_lock_active
+    if not pos_state:
+        return
+    price_now = ex.ticker_last()
+    qty = pos_state.contracts
+    entry = pos_state.entry
+    ex.reduce_only_close()
+    # calc pnl
+    delta_pts = (price_now - entry) if pos_state.side == 'long' else (entry - price_now)
+    pnl = delta_pts * qty * ex.contract_size
+    stats.add_trade(pos_state.side, entry, price_now, qty, pnl, reason)
+    log.info(f"CLOSE {pos_state.side.upper()} entry={entry:.2f} last={price_now:.2f} qty={qty:.4f} pnl={pnl:+.2f} ({reason})")
+    # if closed due to SL -> lock trading until price closes inside zone
+    if "SL" in reason.upper():
+        sl_lock_active = True
+        log.info("SL hit → sl_lock_active = True (pausing all entries until price closes inside envelope zone)")
+    pos_state = None
+
+# ========== Main loop ==========
 def run():
-    ex = create_exchange()
-    ensure_new_day()
-    telegram("🤖 MINI EMA Bot started.\nPair: ETH-USDT-SWAP | TF: 5m | Lot: 15 USDT | TP/SL: 5%")
-
-    # one-time open-fail notify control
-    def notify_open_fail_once(msg):
-        key = now_bkk().strftime("%Y-%m-%d")
-        if STATE["open_fail_notified_for"] != key:
-            telegram(msg)
-            STATE["open_fail_notified_for"] = key
-
+    global pos_state, sl_lock_active
+    ex = OKX()
+    ex.setup()
+    log.info("Bot started: OKX, M15, EMA50/100 + Nadaraya, Market orders, SL fixed points")
     while True:
         try:
-            ensure_new_day()
-            maybe_send_daily_summary()
+            # daily
+            stats.roll_if_new_day()
+            stats.send_report(force=False)
 
-            # If no position → look for signal
-            if STATE["side"] is None:
-                ohlcv = fetch_ohlcv(ex, limit=210)
-                closes = np.array([x[4] for x in ohlcv], dtype=float)
-                if len(closes) < 55:
-                    time.sleep(LOOP_SLEEP); continue
+            # data: need enough bars for NW_LOOKBACK + 2
+            ohlcv = ex.fetch_ohlcv(TIMEFRAME, limit=NW_LOOKBACK + 5)
+            if not ohlcv or len(ohlcv) < NW_LOOKBACK + 2:
+                time.sleep(LOOP_SECONDS); continue
 
-                e9  = ema(closes, 9)
-                e21 = ema(closes, 21)
+            # closed bars: exclude the current live bar
+            closes_closed = [c[4] for c in ohlcv[:-1]]
+            last_closed_close = closes_closed[-1]
+            last_price = ex.ticker_last()
 
-                sig = None
-                if cross_up(e9, e21):
-                    sig = "long"
-                elif cross_down(e9, e21):
-                    sig = "short"
+            # compute trend and bands
+            side_allowed = trend_from_ema(closes_closed)
+            bands = compute_bands(closes_closed)
+            if bands is None:
+                time.sleep(LOOP_SECONDS); continue
 
-                if sig:
-                    # open
-                    od = open_market(ex, sig, LOT_USDT)
-                    if od is None or not od.get('id'):
-                        notify_open_fail_once("⛔️ เปิดออเดอร์ไม่สำเร็จ (ครั้งเดียววันนี้). ตรวจสอบ API/Permission/ขั้นต่ำใน OKX")
-                        time.sleep(LOOP_SLEEP); continue
-
-                    # fetch entry & size
-                    px = price(ex)
-                    STATE["side"] = sig
-                    STATE["entry"] = px
-                    STATE["size"] = float(od.get('amount') or 0.0) or float(ex.amount_to_precision(SYMBOL, LOT_USDT/px))
-                    if sig=='long':
-                        STATE["tp_price"] = STATE["entry"]*(1+TP_PCT)
-                        STATE["sl_price"] = STATE["entry"]*(1-SL_PCT)
-                    else:
-                        STATE["tp_price"] = STATE["entry"]*(1-TP_PCT)
-                        STATE["sl_price"] = STATE["entry"]*(1+SL_PCT)
-            else:
-                # manage TP/SL (no telegram here by request)
-                px = price(ex)
-                hit_tp = False; hit_sl = False
-                if STATE["side"]=='long':
-                    hit_tp = px >= STATE["tp_price"]
-                    hit_sl = px <= STATE["sl_price"]
+            # If we are locked due to SL -> check unlock condition (closed bar close inside zone)
+            if sl_lock_active:
+                # unlock if last closed close is within [lower, upper]
+                if bands.lower <= last_closed_close <= bands.upper:
+                    sl_lock_active = False
+                    log.info("Price closed inside envelope → unlock trading (sl_lock_active=False). Will follow current EMA trend.")
+                    # do not open immediately this same loop; continue to next iteration to use fresh last_price
+                    time.sleep(LOOP_SECONDS)
+                    continue
                 else:
-                    hit_tp = px <= STATE["tp_price"]
-                    hit_sl = px >= STATE["sl_price"]
+                    # remain locked, do not open entries; but still monitor any existing pos (should be none)
+                    time.sleep(LOOP_SECONDS)
+                    continue
 
-                if hit_tp or hit_sl:
-                    # close & update summary
-                    side = STATE["side"]
-                    entry = STATE["entry"]
-                    close_all(ex, side)
-                    # pnl est in USDT using size * price diff
-                    # approximate base amount from LOT_USDT/entry
-                    amt_base = STATE["size"] or (LOT_USDT/entry)
-                    pnl = 0.0
-                    if side=='long':
-                        pnl = (px - entry) * amt_base
-                    else:
-                        pnl = (entry - px) * amt_base
+            # sync position
+            live_pos = ex.fetch_position()
+            if live_pos is None and pos_state is not None:
+                log.info("Position disappeared on exchange; syncing local state.")
+                pos_state = None
 
-                    STATE["summary"]["trades"] += 1
-                    if hit_tp:
-                        STATE["summary"]["wins"] += 1
-                        STATE["summary"]["tp"] += 1
-                    else:
-                        STATE["summary"]["losses"] += 1
-                        STATE["summary"]["sl"] += 1
-                    STATE["summary"]["pnl"] += float(pnl)
+            # If have position -> manage exits
+            if pos_state:
+                # refresh pos info
+                if live_pos:
+                    pos_state.contracts = float(live_pos['contracts'])
+                    pos_state.entry = float(live_pos['entry'])
+                    pos_state.sl_price = compute_sl_price(pos_state.entry, pos_state.side)
+                # TP
+                if tp_hit(pos_state.side, last_price, bands):
+                    close_position(ex, "TP@Envelope")
+                    time.sleep(LOOP_SECONDS); continue
+                # SL fixed points
+                if pos_state.side == 'long' and last_price <= pos_state.sl_price:
+                    close_position(ex, "SL_HIT")
+                    time.sleep(LOOP_SECONDS); continue
+                if pos_state.side == 'short' and last_price >= pos_state.sl_price:
+                    close_position(ex, "SL_HIT")
+                    time.sleep(LOOP_SECONDS); continue
+                # Trend flip -> close immediately (regardless P/L)
+                flip_against = ((pos_state.side == 'long' and side_allowed == TrendSide.SELL) or
+                                (pos_state.side == 'short' and side_allowed == TrendSide.BUY))
+                if flip_against:
+                    close_position(ex, "TrendFlipClose")
+                    time.sleep(LOOP_SECONDS); continue
+                time.sleep(LOOP_SECONDS); continue
 
-                    # reset position
-                    STATE.update({"side":None,"entry":None,"size":0.0,"tp_price":None,"sl_price":None})
+            # No position and not locked -> look for entries (immediate touch)
+            if side_allowed in (TrendSide.BUY, TrendSide.SELL):
+                sig = entry_signal(side_allowed, last_price, bands)
+                if sig:
+                    opened = open_position(ex, sig, last_price)
+                    if not opened:
+                        log.info("Open failed.")
+                    time.sleep(LOOP_SECONDS); continue
 
-            time.sleep(LOOP_SLEEP)
+            time.sleep(LOOP_SECONDS)
 
+        except KeyboardInterrupt:
+            log.info("KeyboardInterrupt, exiting.")
+            break
         except Exception as e:
-            print("Loop error:", e)
-            traceback.print_exc()
-            time.sleep(3)
+            log.exception("Main loop error: %s", e)
+            time.sleep(2)
 
 if __name__ == "__main__":
     run()
