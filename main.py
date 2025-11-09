@@ -26,7 +26,7 @@ TIMEFRAME    = "15m"
 LEVERAGE     = 15
 MARGIN_MODE  = "isolated"        # 'isolated' or 'cross'
 
-POSITION_MARGIN_FRACTION = 0.50   # ใช้ 50% ของ free USDT เป็น margin ต่อไม้
+POSITION_MARGIN_FRACTION = 0.80 # ใช้ 50% ของ free USDT เป็น margin ต่อไม้
 
 EMA_FAST = 50
 EMA_SLOW = 100
