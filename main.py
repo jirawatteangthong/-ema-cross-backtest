@@ -1,4 +1,3 @@
-# main.py
 # OKX M15 Bot — EMA50/100 Trend + Nadaraya-Watson Envelope
 # Single-file version. Edit config section below as needed.
 # .env must contain OKX_API_KEY, OKX_SECRET, OKX_PASSWORD, (optional) TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
